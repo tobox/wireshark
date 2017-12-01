@@ -27,12 +27,21 @@
 #include <epan/packet.h>
 #include <epan/prefs.h>
 #include <epan/conversation.h>
+#include <epan/dissectors/packet-tcp.h>
+
+#include <stdio.h>
+
 void proto_reg_handoff_adwin(void);
 void proto_register_adwin(void);
 
+/* ADwin default port for both TCP and UDP communication */
 #define ADWIN_COMM_PORT 6543 /* Not IANA registered */
 
-/* lengths of valid packet structures */
+/* magic flags for tcp headers */
+#define ADWIN_TCP_MAGIC_FLAG_REQUEST  0x42ad4214
+#define ADWIN_TCP_MAGIC_FLAG_RESPONSE 0x42ad4253
+
+/* lengths of valid UDP packet structures */
 #define UDPH1_OLD_LENGTH              52
 #define UDPH1_NEW_LENGTH              56
 #define UDPR1_LENGTH                  32
@@ -106,16 +115,47 @@ static const value_string error_code_mapping[] = {
 };
 static value_string_ext error_code_mapping_ext = VALUE_STRING_EXT_INIT(error_code_mapping);
 
+typedef enum {
+	ADWIN_DATA_TYPE_INVALID = -1,
+	ADWIN_BYTE = 1,    /* int_8 */
+	ADWIN_SHORT = 2,   /* int_16 */
+	ADWIN_LONG = 3,    /* int_32 */
+	ADWIN_INTEGER = 4, /* int32, usually no used */
+	ADWIN_FLOAT = 5,   /* float32 */
+	ADWIN_DOUBLE = 6,  /* float64 */
+	ADWIN_INT64 = 7,   /* int_64 */
+	ADWIN_STRING = 8,  /* int_8, only T12 */
+	ADWIN_FLOAT_OR_INTEGER = 9, /* workaround for wireshark */
+	ADWIN_VARIANT = 20,
+} adwin_data_type_t;
+
 static const value_string data_type_mapping[] = {
-	{ 2, "short / int"},
-	{ 3, "int"},
-	{ 4, "long"},
-	{ 5, "float"},
-	{ 6, "double"},
-	{ 20, "variant"},
+	{ ADWIN_BYTE,    "int8 (byte)" },
+	{ ADWIN_SHORT,   "int16 (short)" },
+	{ ADWIN_LONG,    "int32 (long)" },
+	{ ADWIN_INTEGER, "int32 (int)" },
+	{ ADWIN_FLOAT,   "float" },
+	{ ADWIN_DOUBLE,  "double" },
+	{ ADWIN_INT64,   "int64" },
+	{ ADWIN_STRING,  "string" },
+	{ ADWIN_VARIANT, "variant" },
+	{ ADWIN_FLOAT_OR_INTEGER, "float or int32" },
+	{ ADWIN_DATA_TYPE_INVALID, "invalid type" },
 	{ 0, NULL },
 };
 static value_string_ext data_type_mapping_ext = VALUE_STRING_EXT_INIT(data_type_mapping);
+
+#define DISP_STR_PAR          0
+#define DISP_STR_FPAR         1
+#define DISP_STR_FPAR_DOUBLE  2
+#define DISP_STR_DATA         3
+#define DISP_STR_FIFO         4
+#define DISP_STR_DATA_OR_FIFO 5
+#define DISP_STR_MEMORY       6
+#define DISP_STR_INVALID      7
+
+const gchar* display_strings_data[] = { "Par", "FPar", "FPar_Double", "Data_", "Fifo_",
+					"Data/Fifo", "Memory", "INVALID_TYPE"};
 
 #define I_3PLUS1                           0
 #define I_LOAD_BIN_FILE                    4
@@ -126,6 +166,11 @@ static value_string_ext data_type_mapping_ext = VALUE_STRING_EXT_INIT(data_type_
 #define I_GET_WORKLOAD                    20
 #define I_GET_FIFO                        24
 #define I_SET_FIFO                        25
+#define I_GET_DATA_N                      40
+#define I_SET_DATA_N                      41
+#define I_GET_FIFO_N                      42
+#define I_SET_FIFO_N                      43
+#define I_GET_DATA_INFO                   45
 #define I_BOOT                            50
 #define I_GET_DATA_TYPE                  100
 #define I_GET_DATA_SHIFTED_HANDSHAKE     107
@@ -134,6 +179,7 @@ static value_string_ext data_type_mapping_ext = VALUE_STRING_EXT_INIT(data_type_
 #define I_SET_FIFO_RETRY                 125
 #define I_GET_DATA_SMALL                 207
 #define I_TEST_VERSION                   255
+#define I_AUTHENTICATE                   300
 #define I_GET_ARM_VERSION               1000
 #define I_GET_MEMORY                 1000000
 
@@ -147,6 +193,11 @@ static const value_string instruction_mapping[] = {
 	{ I_GET_WORKLOAD,               "Get workload"},
 	{ I_GET_FIFO,                   "Get fifo" },
 	{ I_SET_FIFO,                   "Set fifo" },
+	{ I_GET_DATA_N,                 "Get Data with variable byte size" },
+	{ I_SET_DATA_N,                 "Set Data with variable byte size" },
+	{ I_GET_FIFO_N,                 "Get Fifo with variable byte size" },
+	{ I_SET_FIFO_N,                 "Set Fifo with variable byte size" },
+	{ I_GET_DATA_INFO,              "Get Data/Fifo Information" },
 	{ I_BOOT,                       "Boot" },
 	{ I_GET_DATA_TYPE,              "Get data type" },
 	{ I_GET_DATA_SHIFTED_HANDSHAKE, "Get data (shifted handshake)" },
@@ -155,6 +206,7 @@ static const value_string instruction_mapping[] = {
 	{ I_SET_FIFO_RETRY,             "Set fifo - retry" },
 	{ I_GET_DATA_SMALL,             "Get data (small/fast)" },
 	{ I_TEST_VERSION,               "Get/test version information" },
+	{ I_AUTHENTICATE,               "Authenticate" },
 	{ I_GET_ARM_VERSION,            "Get ARM-Version" },
 	{ I_GET_MEMORY,                 "Get memory DSP" },
 	{ 0, NULL },
@@ -179,6 +231,7 @@ static value_string_ext instruction_mapping_ext = VALUE_STRING_EXT_INIT(instruct
 #define I_3P1_CLEAR_FIFO                 21
 #define I_3P1_GET_FIFO_EMPTY             22
 #define I_3P1_GET_FIFO_COUNT             23
+#define I_3P1_GET_DATA_STRING_SIZE       44
 static const value_string instruction_3plus1_mapping[] = {
 	{ I_3P1_GET_PAR,               "Get parameter"},
 	{ I_3P1_START,                 "Start process"},
@@ -197,7 +250,8 @@ static const value_string instruction_3plus1_mapping[] = {
 	{ I_3P1_CLEAR_FIFO,            "Clear fifo"},
 	{ I_3P1_GET_FIFO_EMPTY,        "Get fifo empty"},
 	{ I_3P1_GET_FIFO_COUNT,        "Get fifo full/count"},
-	{ 0,               NULL },
+	{ I_3P1_GET_DATA_STRING_SIZE,  "Get zero-terminated String Size" },
+	{ 0, NULL },
 };
 static value_string_ext instruction_3plus1_mapping_ext = VALUE_STRING_EXT_INIT(instruction_3plus1_mapping);
 
@@ -212,22 +266,22 @@ static const value_string parameter_mapping[] = {
 	{ 908 , "Status of Process No. 08"},
 	{ 909 , "Status of Process No. 09"},
 	{ 910 , "Status of Process No. 10"},
-	{ 911 , "GlobalDelay for Process No. 01"},
-	{ 912 , "GlobalDelay for Process No. 02"},
-	{ 913 , "GlobalDelay for Process No. 03"},
-	{ 914 , "GlobalDelay for Process No. 04"},
-	{ 915 , "GlobalDelay for Process No. 05"},
-	{ 916 , "GlobalDelay for Process No. 06"},
-	{ 917 , "GlobalDelay for Process No. 07"},
-	{ 918 , "GlobalDelay for Process No. 08"},
-	{ 919 , "GlobalDelay for Process No. 09"},
-	{ 920 , "GlobalDelay for Process No. 10"},
-	{ 921 , "GlobalDelay for Process No. 11"},
-	{ 922 , "GlobalDelay for Process No. 12"},
-	{ 923 , "GlobalDelay for Process No. 13"},
-	{ 924 , "GlobalDelay for Process No. 14"},
-	{ 925 , "GlobalDelay for Process No. 15"},
-	{ 926 , "GlobalDelay for Process No. 16"},
+	{ 911 , "Processdelay for Process No. 01"},
+	{ 912 , "Processdelay for Process No. 02"},
+	{ 913 , "Processdelay for Process No. 03"},
+	{ 914 , "Processdelay for Process No. 04"},
+	{ 915 , "Processdelay for Process No. 05"},
+	{ 916 , "Processdelay for Process No. 06"},
+	{ 917 , "Processdelay for Process No. 07"},
+	{ 918 , "Processdelay for Process No. 08"},
+	{ 919 , "Processdelay for Process No. 09"},
+	{ 920 , "Processdelay for Process No. 10"},
+	{ 921 , "Processdelay for Process No. 11"},
+	{ 922 , "Processdelay for Process No. 12"},
+	{ 923 , "Processdelay for Process No. 13"},
+	{ 924 , "Processdelay for Process No. 14"},
+	{ 925 , "Processdelay for Process No. 15"},
+	{ 926 , "Processdelay for Process No. 16"},
 	{ 951 , "Debug Information of Process No. 01"},
 	{ 952 , "Debug Information of Process No. 02"},
 	{ 953 , "Debug Information of Process No. 03"},
@@ -441,26 +495,42 @@ static value_string_ext packet_type_mapping_ext = VALUE_STRING_EXT_INIT(packet_t
 /* Initialize the protocol and registered fields */
 static int proto_adwin                = -1;
 
+static unsigned int global_adwin_port = ADWIN_COMM_PORT;
 static int global_adwin_dissect_data  = 1;
 
 static int hf_adwin_address           = -1;
 static int hf_adwin_armVersion        = -1;
 static int hf_adwin_binfilesize       = -1;
+static int hf_adwin_blob              = -1;
 static int hf_adwin_blocksize         = -1;
+static int hf_adwin_conn_count        = -1;
 static int hf_adwin_count             = -1;
 static int hf_adwin_complete_packets  = -1;
 static int hf_adwin_data              = -1;
-static int hf_adwin_data_int          = -1;
+static int hf_adwin_data_int8         = -1;
+static int hf_adwin_data_int8_hex     = -1;
+static int hf_adwin_data_int16        = -1;
+static int hf_adwin_data_int16_hex    = -1;
+static int hf_adwin_data_int32        = -1;
+static int hf_adwin_data_int32_hex    = -1;
+static int hf_adwin_data_int64        = -1;
+static int hf_adwin_data_int64_hex    = -1;
 static int hf_adwin_data_float        = -1;
-static int hf_adwin_data_hex          = -1;
+static int hf_adwin_data_double       = -1;
+static int hf_adwin_data_string       = -1;
 static int hf_adwin_data_no16         = -1;
 static int hf_adwin_data_no32         = -1;
 static int hf_adwin_data_packet_index = -1;
+static int hf_adwin_data_size         = -1;
 static int hf_adwin_data_type         = -1;
 static int hf_adwin_dll_version       = -1;
 static int hf_adwin_fifo_no16         = -1;
 static int hf_adwin_fifo_no32         = -1;
+static int hf_adwin_fifo_full         = -1;
+static int hf_adwin_firmware_vers     = -1;
+static int hf_adwin_firmware_vers_beta= -1;
 static int hf_adwin_instruction       = -1;
+static int hf_adwin_is_fifo           = -1;
 static int hf_adwin_is_range          = -1;
 static int hf_adwin_i3plus1           = -1;
 static int hf_adwin_link_addr         = -1;
@@ -480,15 +550,25 @@ static int hf_adwin_processor         = -1;
 static int hf_adwin_response_in       = -1;
 static int hf_adwin_response_to       = -1;
 static int hf_adwin_response_time     = -1;
+static int hf_adwin_response_to_instruction = -1;
+static int hf_adwin_response_to_i3plus1 = -1;
 static int hf_adwin_retry_packet_index= -1;
 static int hf_adwin_request_no        = -1;
 static int hf_adwin_start_index       = -1;
-static int hf_adwin_status            = -1;
+static int hf_adwin_status_final      = -1;
+static int hf_adwin_status_header     = -1;
+static int hf_adwin_tcp_error         = -1;
+static int hf_adwin_tcp_req_count     = -1;
+static int hf_adwin_tcp_req_flag      = -1;
+static int hf_adwin_tcp_req_len       = -1;
+static int hf_adwin_tcp_resp_flag     = -1;
 static int hf_adwin_timeout           = -1;
+static int hf_adwin_timeout_size      = -1;
 static int hf_adwin_unused            = -1;
 static int hf_adwin_val1              = -1;
 static int hf_adwin_val1f             = -1;
 static int hf_adwin_val2              = -1;
+static int hf_adwin_val2f             = -1;
 static int hf_adwin_val3              = -1;
 static int hf_adwin_val4              = -1;
 
@@ -496,11 +576,21 @@ static int hf_adwin_val4              = -1;
 static gint ett_adwin                 = -1;
 static gint ett_adwin_debug           = -1;
 
+static dissector_handle_t data_handle;
+
 /* response/request tracking */
 typedef struct _adwin_transaction_t {
-	guint32 req_frame;
-	guint32 rep_frame;
-	nstime_t req_time;
+	guint32 req_frame;          /* frame number of request */
+	guint32 rep_frame;          /* frame number of response */
+	nstime_t req_time;          /* time of request (to calculate response time) */
+	guint32 command;            /* command of request (required to make sense of response) */
+	guint32 command3p1;         /* subcommand of request (required to make sense of response) */
+
+	/* the following variables can store some (unstructured) information 
+	 * of  the request that is needed to decode the response */
+	guint32 additional_info1;
+	guint32 additional_info2;
+	guint32 additional_info3;
 } adwin_transaction_t;
 
 /* response/request tracking */
@@ -513,13 +603,14 @@ typedef enum {
 	ADWIN_RESPONSE
 } adwin_direction_t;
 
-static void
-adwin_request_response_handling(tvbuff_t *tvb, packet_info *pinfo,
-				proto_tree *adwin_tree, guint32 seq_num, adwin_direction_t direction)
+/* Note: the padwin_trans parameter is (currently) only used for TCP sessions. */
+static int
+adwin_request_response_handling(tvbuff_t *tvb, packet_info *pinfo, proto_tree *adwin_tree, guint32 seq_num,
+				adwin_direction_t direction, adwin_transaction_t **padwin_trans)
 {
 	conversation_t *conversation;
 	adwin_conv_info_t *adwin_info;
-	adwin_transaction_t *adwin_trans;
+	adwin_transaction_t *adwin_trans = NULL;
 
 	/*
 	 * Find or create a conversation for this connection.
@@ -541,69 +632,211 @@ adwin_request_response_handling(tvbuff_t *tvb, packet_info *pinfo,
 		conversation_add_proto_data(conversation, proto_adwin, adwin_info);
 	}
 	if (!pinfo->fd->flags.visited) {
-		if (direction == ADWIN_REQUEST) {
+		switch (direction) {
+		case ADWIN_REQUEST: 
 			/* This is a request */
 			adwin_trans = wmem_new(wmem_file_scope(), adwin_transaction_t);
-			adwin_trans->req_frame = pinfo->num;
+			adwin_trans->req_frame = pinfo->fd->num;
 			adwin_trans->rep_frame = 0;
-			adwin_trans->req_time = pinfo->abs_ts;
+			adwin_trans->req_time = pinfo->fd->abs_ts;
 			wmem_map_insert(adwin_info->pdus, GUINT_TO_POINTER(seq_num), (void *)adwin_trans);
-		} else {
+			break;
+		case ADWIN_RESPONSE:
 			adwin_trans = (adwin_transaction_t *)wmem_map_lookup(adwin_info->pdus, GUINT_TO_POINTER(seq_num));
 			if (adwin_trans) {
-				adwin_trans->rep_frame = pinfo->num;
+				adwin_trans->rep_frame = pinfo->fd->num;
 			}
+			break;
 		}
 	} else {
 		adwin_trans = (adwin_transaction_t *)wmem_map_lookup(adwin_info->pdus, GUINT_TO_POINTER(seq_num));
 	}
+
 	if (!adwin_trans) {
 		/* create a "fake" adwin_trans structure */
 		adwin_trans = wmem_new(wmem_packet_scope(), adwin_transaction_t);
 		adwin_trans->req_frame = 0;
 		adwin_trans->rep_frame = 0;
-		adwin_trans->req_time = pinfo->abs_ts;
+		adwin_trans->req_time = pinfo->fd->abs_ts;
 	}
 
-	/* print state tracking in the tree */
-	if (direction == ADWIN_REQUEST) {
-		/* This is a request */
-		if (adwin_trans->rep_frame) {
-			proto_item *it;
-
-			it = proto_tree_add_uint(adwin_tree, hf_adwin_response_in,
-					tvb, 0, 0, adwin_trans->rep_frame);
-			PROTO_ITEM_SET_GENERATED(it);
+	if (adwin_tree) {
+		/* print state tracking in the tree */
+		if ((direction == ADWIN_REQUEST)) {
+			/* This is a request */
+			if (adwin_trans->rep_frame) {
+				proto_item *it;
+				
+				it = proto_tree_add_uint(adwin_tree, hf_adwin_response_in,
+							 tvb, 0, 0, adwin_trans->rep_frame);
+				PROTO_ITEM_SET_GENERATED(it);
+			}
+		} else {
+			/* This is a reply */
+			if (adwin_trans->req_frame) {
+				proto_item *it;
+				nstime_t ns;
+				
+				it = proto_tree_add_uint(adwin_tree, hf_adwin_response_to,
+							 tvb, 0, 0, adwin_trans->req_frame);
+				PROTO_ITEM_SET_GENERATED(it);
+				
+				nstime_delta(&ns, &pinfo->fd->abs_ts, &adwin_trans->req_time);
+				it = proto_tree_add_time(adwin_tree, hf_adwin_response_time, tvb, 0, 0, &ns);
+				PROTO_ITEM_SET_GENERATED(it);
+			}
 		}
-	} else {
-		/* This is a reply */
-		if (adwin_trans->req_frame) {
-			proto_item *it;
-			nstime_t ns;
+	}
 
-			it = proto_tree_add_uint(adwin_tree, hf_adwin_response_to,
-					tvb, 0, 0, adwin_trans->req_frame);
-			PROTO_ITEM_SET_GENERATED(it);
+	if (padwin_trans)
+		*padwin_trans = adwin_trans;
+	return 0;
+}
 
-			nstime_delta(&ns, &pinfo->abs_ts, &adwin_trans->req_time);
-			it = proto_tree_add_time(adwin_tree, hf_adwin_response_time, tvb, 0, 0, &ns);
-			PROTO_ITEM_SET_GENERATED(it);
+gint32 bytes_per_value(guint data_type) {
+	gint32 ADWIN_DATA_BYTES_PER_VALUE[] = {0, 1, 2, 4, 4, 4, 8, 8, 1, 4};
+
+	if (data_type > sizeof(ADWIN_DATA_BYTES_PER_VALUE)/sizeof(ADWIN_DATA_BYTES_PER_VALUE[0])) {
+		/* printf("Invalid data type %u\n", data_type); */
+		return 0;
+	}
+
+	return ADWIN_DATA_BYTES_PER_VALUE[data_type];
+}
+
+void dissect_data(tvbuff_t *tvb _U_, packet_info *pinfo _U_, proto_tree *tree _U_,
+		  guint32 tvb_offset _U_, guint32 data_no _U_, guint32 start_index _U_, guint32 count _U_,
+		  guint32 data_type _U_, guint32 data_string_type _U_) { }
+#if 0
+void dissect_data(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
+		  guint32 tvb_offset, guint32 data_no, guint32 start_index, guint32 count,
+		  guint32 data_type, guint32 data_string_type) {
+	guint32 i;
+	proto_item *item;
+	const gchar* data_string;
+	int bpv;
+
+	bpv = bytes_per_value(data_type);
+	
+	if (! global_adwin_dissect_data) {
+		call_dissector(data_handle, tvb_new_subset_length(tvb, tvb_offset, count * bpv), pinfo, tree);
+		return;
+	}
+
+	if (data_string_type >= DISP_STR_INVALID) {
+		data_string_type = DISP_STR_INVALID;
+	}
+	data_string = display_strings_data[data_string_type];
+	
+	for (i = 0; i < count; i++) {
+		guint32 offset;
+		offset = tvb_offset + i * bpv;
+		
+		switch (data_type) {
+		case ADWIN_DATA_TYPE_INVALID:
+		case ADWIN_VARIANT:
+			/* not transferred over network */
+			break;
+		case ADWIN_BYTE: {
+			guint8 value;
+			value = tvb_get_guint8(tvb, offset);
+			proto_tree_add_text(tree, tvb, offset, bpv, "%s%.0d[%d]: %10d - 0x%02x",
+					    data_string, data_no, start_index + i, value, value);
+			item = proto_tree_add_item(tree, hf_adwin_data_int8,    tvb, offset, 1, ENC_LITTLE_ENDIAN);
+			PROTO_ITEM_SET_HIDDEN(item);
+			item = proto_tree_add_item(tree, hf_adwin_data_int8_hex, tvb, offset, 1, ENC_LITTLE_ENDIAN);
+			PROTO_ITEM_SET_HIDDEN(item);
+			break;
+		}
+		case ADWIN_SHORT: {
+			guint16 value;
+			value = tvb_get_letohs(tvb, offset);
+			proto_tree_add_text(tree, tvb, offset, bpv, "%s%.0d[%d]: %10d - 0x%04x",
+					    data_string, data_no, start_index + i, value, value);
+			item = proto_tree_add_item(tree, hf_adwin_data_int16,    tvb, offset, 2, ENC_LITTLE_ENDIAN);
+			PROTO_ITEM_SET_HIDDEN(item);
+			item = proto_tree_add_item(tree, hf_adwin_data_int16_hex, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+			PROTO_ITEM_SET_HIDDEN(item);
+			break;
+		}
+		case ADWIN_LONG:
+		case ADWIN_INTEGER: {
+			guint32 value;
+			value = tvb_get_letohl(tvb, offset);
+			proto_tree_add_text(tree, tvb, offset, bpv, "%s%.0d[%d]: %10d - 0x%08x",
+					    data_string, data_no, start_index + i, value, value);
+			item = proto_tree_add_item(tree, hf_adwin_data_int32,     tvb, offset, 4, ENC_LITTLE_ENDIAN);
+			PROTO_ITEM_SET_HIDDEN(item);
+			item = proto_tree_add_item(tree, hf_adwin_data_int32_hex, tvb, offset, 4, ENC_LITTLE_ENDIAN);
+			PROTO_ITEM_SET_HIDDEN(item);
+			break;
+		}
+		case ADWIN_FLOAT: {
+			gfloat value;
+			value = tvb_get_letohieee_float(tvb, offset);
+			proto_tree_add_text(tree, tvb, offset, bpv, "%s%.0d[%d]: %10f",
+					    data_string, data_no, start_index + i, value);
+			item = proto_tree_add_item(tree, hf_adwin_data_float,     tvb, offset, 4, ENC_LITTLE_ENDIAN);
+			PROTO_ITEM_SET_HIDDEN(item);
+			break;
+		}
+		case ADWIN_FLOAT_OR_INTEGER: {
+			guint32 value;
+			gfloat fvalue;
+			value = tvb_get_letohl(tvb, offset);
+			fvalue = tvb_get_letohieee_float(tvb, offset);
+			proto_tree_add_text(tree, tvb, offset, bpv, "%s%.0d[%d]: %10d - 0x%08x - %10f",
+					    data_string, data_no, start_index + i, value, value, fvalue);
+			item = proto_tree_add_item(tree, hf_adwin_data_int32,     tvb, offset, 4, ENC_LITTLE_ENDIAN);
+			PROTO_ITEM_SET_HIDDEN(item);
+			item = proto_tree_add_item(tree, hf_adwin_data_int32_hex, tvb, offset, 4, ENC_LITTLE_ENDIAN);
+			PROTO_ITEM_SET_HIDDEN(item);
+			item = proto_tree_add_item(tree, hf_adwin_data_float,     tvb, offset, 4, ENC_LITTLE_ENDIAN);
+			PROTO_ITEM_SET_HIDDEN(item);
+			break;
+		}			
+		case ADWIN_DOUBLE: {
+			gfloat value;
+			value = tvb_get_letohieee_double(tvb, offset);
+			proto_tree_add_text(tree, tvb, offset, bpv, "%s%.0d[%d]: %10e",
+					    data_string, data_no, start_index + i, value);
+			item = proto_tree_add_item(tree, hf_adwin_data_double,     tvb, offset, 8, ENC_LITTLE_ENDIAN);
+			PROTO_ITEM_SET_HIDDEN(item);
+			break;
+		}
+		case ADWIN_INT64: {
+			guint64 value;
+			value = tvb_get_letoh64(tvb, offset);
+			proto_tree_add_text(tree, tvb, offset, bpv, "%s%.0d[%d]: %10li - 0x%016lx",
+					    data_string, data_no, start_index + i, value, value);
+			item = proto_tree_add_item(tree, hf_adwin_data_int64,     tvb, offset, 8, ENC_LITTLE_ENDIAN);
+			PROTO_ITEM_SET_HIDDEN(item);
+			item = proto_tree_add_item(tree, hf_adwin_data_int64_hex, tvb, offset, 8, ENC_LITTLE_ENDIAN);
+			PROTO_ITEM_SET_HIDDEN(item);
+			break;
+		}
+		case ADWIN_STRING: {
+			if (i == 0) {
+				proto_tree_add_item(tree, hf_adwin_data_string,          tvb, offset, count, ENC_ASCII|ENC_NA);
+			}
+		}
 		}
 	}
 }
+#endif
 
 static void
 dissect_UDPH1_generic(tvbuff_t *tvb, packet_info *pinfo,
 		      proto_tree *adwin_tree, proto_tree *adwin_debug_tree, gchar** info_string, const gchar* packet_name)
 {
-	guint32 i3plus1code =  0, instructionID, seq_num;
+	guint32 i3plus1code = 0, instructionID, seq_num;
 
 	instructionID = tvb_get_letohl(tvb, 0);
 	*info_string = wmem_strdup_printf(wmem_packet_scope(), "%s: %s", packet_name,
 				        val_to_str_ext(instructionID, &instruction_mapping_ext, "unknown instruction: %d"));
 
 	if (instructionID == I_3PLUS1) {
-		gchar *tmp = *info_string;
+		gchar *tmp = *info_string; //todo
 
 		i3plus1code = tvb_get_letohl(tvb, 20);
 		*info_string = wmem_strdup_printf(wmem_packet_scope(), "%s: %s", tmp, val_to_str_ext(i3plus1code, &instruction_3plus1_mapping_ext, "unknown 3+1 code: %d"));
@@ -611,7 +844,8 @@ dissect_UDPH1_generic(tvbuff_t *tvb, packet_info *pinfo,
 
 	/* Get the transaction identifier */
 	seq_num = tvb_get_letohl(tvb, 4);
-	adwin_request_response_handling(tvb, pinfo, adwin_tree, seq_num, ADWIN_REQUEST);
+
+	adwin_request_response_handling(tvb, pinfo, adwin_tree, seq_num, ADWIN_REQUEST, NULL);
 
 	if (! adwin_tree)
 		return;
@@ -753,7 +987,6 @@ dissect_UDPH1_generic(tvbuff_t *tvb, packet_info *pinfo,
 	proto_tree_add_item(adwin_tree, hf_adwin_timeout,        tvb, 40,  4, ENC_LITTLE_ENDIAN);
 	proto_tree_add_item(adwin_debug_tree, hf_adwin_osys,     tvb, 44,  4, ENC_LITTLE_ENDIAN);
 	proto_tree_add_item(adwin_debug_tree, hf_adwin_unused,   tvb, 48,  4, ENC_NA);
-
 }
 
 
@@ -789,8 +1022,7 @@ dissect_UDPH1_new(tvbuff_t *tvb, packet_info *pinfo,
 }
 
 static void
-dissect_UDPR1(tvbuff_t *tvb, packet_info *pinfo,
-	      proto_tree *adwin_tree, proto_tree *adwin_debug_tree,
+dissect_UDPR1(tvbuff_t *tvb, packet_info *pinfo, proto_tree *adwin_tree, proto_tree *adwin_debug_tree,
 	      gchar** info_string)
 {
 	const gchar *status_string;
@@ -806,16 +1038,16 @@ dissect_UDPR1(tvbuff_t *tvb, packet_info *pinfo,
 
 	/* Get the transaction identifier */
 	seq_num = tvb_get_letohl(tvb, 4);
-	adwin_request_response_handling(tvb, pinfo, adwin_tree, seq_num, ADWIN_RESPONSE);
+	adwin_request_response_handling(tvb, pinfo, adwin_tree, seq_num, ADWIN_RESPONSE, NULL);
 
 	if (! adwin_tree)
 		return;
 
 	SET_PACKET_TYPE(adwin_tree, APT_UDPR1);
-	proto_tree_add_item(adwin_tree, hf_adwin_status,         tvb, 0,  4, ENC_LITTLE_ENDIAN);
-	proto_tree_add_item(adwin_tree, hf_adwin_packet_index,   tvb, 4,  4, ENC_LITTLE_ENDIAN);
-	proto_tree_add_item(adwin_tree, hf_adwin_val1,           tvb, 8,  4, ENC_LITTLE_ENDIAN);
-	proto_tree_add_item(adwin_tree, hf_adwin_val1f,          tvb, 8,  4, ENC_LITTLE_ENDIAN);
+	proto_tree_add_item(adwin_tree, hf_adwin_status_header, tvb,  0,  4, ENC_LITTLE_ENDIAN);
+	proto_tree_add_item(adwin_tree, hf_adwin_packet_index,  tvb,  4,  4, ENC_LITTLE_ENDIAN);
+	proto_tree_add_item(adwin_tree, hf_adwin_val1,          tvb,  8,  4, ENC_LITTLE_ENDIAN);
+	proto_tree_add_item(adwin_tree, hf_adwin_val1f,         tvb,  8,  4, ENC_LITTLE_ENDIAN);
 	proto_tree_add_item(adwin_tree, hf_adwin_val2,          tvb, 12,  4, ENC_LITTLE_ENDIAN);
 	proto_tree_add_item(adwin_tree, hf_adwin_val3,          tvb, 16,  4, ENC_LITTLE_ENDIAN);
 	proto_tree_add_item(adwin_tree, hf_adwin_val4,          tvb, 20,  4, ENC_LITTLE_ENDIAN);
@@ -828,7 +1060,7 @@ dissect_UDPR2(tvbuff_t *tvb, packet_info *pinfo,
 	      gchar** info_string)
 {
 	const gchar *status_string;
-	guint32 i, status, seq_num;
+	guint32 status, seq_num;
 
 	status = tvb_get_letohl(tvb, 0);
 	status_string = try_val_to_str_ext(status, &error_code_mapping_ext);
@@ -840,46 +1072,27 @@ dissect_UDPR2(tvbuff_t *tvb, packet_info *pinfo,
 
 	/* Get the transaction identifier */
 	seq_num = tvb_get_letohl(tvb, 4);
-	adwin_request_response_handling(tvb, pinfo, adwin_tree, seq_num, ADWIN_RESPONSE);
+	adwin_request_response_handling(tvb, pinfo, adwin_tree, seq_num, ADWIN_RESPONSE, NULL);
 
 	if (! adwin_tree)
 		return;
 
 	SET_PACKET_TYPE(adwin_tree, APT_UDPR2);
-	proto_tree_add_item(adwin_tree, hf_adwin_status,         tvb, 0,  4, ENC_LITTLE_ENDIAN);
+	proto_tree_add_item(adwin_tree, hf_adwin_status_header,  tvb, 0,  4, ENC_LITTLE_ENDIAN);
 	proto_tree_add_item(adwin_tree, hf_adwin_packet_index,   tvb, 4,  4, ENC_LITTLE_ENDIAN);
-
-	if (! global_adwin_dissect_data) {
-		call_data_dissector(tvb_new_subset_length(tvb, 8, 250*4), pinfo, adwin_debug_tree);
-		return;
-	}
-
-	for (i = 0; i < 250; i++) {
-		proto_item *item;
-		guint32 offset = 8 + i * (int)sizeof(guint32);
-		gint32 value = tvb_get_letohl(tvb, offset);
-		void * fvalue = &value;
-		proto_tree_add_none_format(adwin_debug_tree, hf_adwin_data, tvb, offset, 4,
-				    "Data[%3d]: %10d - %10f - 0x%08x",
-				    i, value, *(float*)fvalue, value);
-		item = proto_tree_add_item(adwin_debug_tree, hf_adwin_data_int,   tvb, offset, 4, ENC_LITTLE_ENDIAN);
-		PROTO_ITEM_SET_HIDDEN(item);
-		item = proto_tree_add_item(adwin_debug_tree, hf_adwin_data_float, tvb, offset, 4, ENC_LITTLE_ENDIAN);
-		PROTO_ITEM_SET_HIDDEN(item);
-		item = proto_tree_add_item(adwin_debug_tree, hf_adwin_data_hex,   tvb, offset, 4, ENC_LITTLE_ENDIAN);
-		PROTO_ITEM_SET_HIDDEN(item);
-	}
+	
+	dissect_data(tvb, pinfo, adwin_debug_tree, 8, 0, 0, 250, ADWIN_FLOAT_OR_INTEGER, DISP_STR_DATA_OR_FIFO);
 }
 
 static void
 dissect_UDPR3(tvbuff_t *tvb, packet_info *pinfo,
 	      proto_tree *adwin_tree, proto_tree *adwin_debug_tree)
 {
-	guint32 i, seq_num;
+	guint32 seq_num;
 
 	/* Get the transaction identifier */
 	seq_num = tvb_get_letohl(tvb, 0);
-	adwin_request_response_handling(tvb, pinfo, adwin_tree, seq_num, ADWIN_RESPONSE);
+	adwin_request_response_handling(tvb, pinfo, adwin_tree, seq_num, ADWIN_RESPONSE, NULL);
 
 	if (! adwin_tree)
 		return;
@@ -888,26 +1101,7 @@ dissect_UDPR3(tvbuff_t *tvb, packet_info *pinfo,
 	proto_tree_add_item(adwin_tree, hf_adwin_packet_index,   tvb, 0,  4, ENC_LITTLE_ENDIAN);
 	proto_tree_add_item(adwin_tree, hf_adwin_packet_no,      tvb, 4,  4, ENC_LITTLE_ENDIAN);
 
-	if (! global_adwin_dissect_data) {
-		call_data_dissector(tvb_new_subset_length(tvb, 8, 350*4), pinfo, adwin_debug_tree);
-		return;
-	}
-
-	for (i = 0; i < 350; i++) {
-		proto_item *item;
-		guint32 offset = 8 + i * (int)sizeof(guint32);
-		gint32 value = tvb_get_letohl(tvb, offset);
-		void * fvalue = &value;
-		proto_tree_add_none_format(adwin_debug_tree, hf_adwin_data, tvb, offset, 4,
-				    "Data[%3d]: %10d - %10f - 0x%08x",
-				    i, value, *(float*)fvalue, value);
-		item = proto_tree_add_item(adwin_debug_tree, hf_adwin_data_int,   tvb, offset, 4, ENC_LITTLE_ENDIAN);
-		PROTO_ITEM_SET_HIDDEN(item);
-		item = proto_tree_add_item(adwin_debug_tree, hf_adwin_data_float, tvb, offset, 4, ENC_LITTLE_ENDIAN);
-		PROTO_ITEM_SET_HIDDEN(item);
-		item = proto_tree_add_item(adwin_debug_tree, hf_adwin_data_hex,   tvb, offset, 4, ENC_LITTLE_ENDIAN);
-		PROTO_ITEM_SET_HIDDEN(item);
-	}
+	dissect_data(tvb, pinfo, adwin_debug_tree, 8, 0, 0, 350, ADWIN_FLOAT_OR_INTEGER, DISP_STR_DATA_OR_FIFO);
 }
 
 static void
@@ -915,7 +1109,7 @@ dissect_UDPR4(tvbuff_t *tvb, packet_info *pinfo,
 	      proto_tree *adwin_tree, proto_tree *adwin_debug_tree, gchar** info_string)
 {
 	const gchar *status_string;
-	guint32 data_type, i, status, seq_num;
+	guint32 data_type, status, seq_num;
 
 	status = tvb_get_letohl(tvb, 0);
 	status_string = try_val_to_str_ext(status, &error_code_mapping_ext);
@@ -927,69 +1121,31 @@ dissect_UDPR4(tvbuff_t *tvb, packet_info *pinfo,
 
 	/* Get the transaction identifier */
 	seq_num = tvb_get_letohl(tvb, 4);
-	adwin_request_response_handling(tvb, pinfo, adwin_tree, seq_num, ADWIN_RESPONSE);
+	adwin_request_response_handling(tvb, pinfo, adwin_tree, seq_num, ADWIN_RESPONSE, NULL);
 
 	if (! adwin_tree)
 		return;
 
 	SET_PACKET_TYPE(adwin_tree, APT_UDPR4);
-	proto_tree_add_item(adwin_tree, hf_adwin_status,         tvb, 0,  4, ENC_LITTLE_ENDIAN);
+	proto_tree_add_item(adwin_tree, hf_adwin_status_header,  tvb, 0,  4, ENC_LITTLE_ENDIAN);
 	proto_tree_add_item(adwin_tree, hf_adwin_packet_index,   tvb, 4,  4, ENC_LITTLE_ENDIAN);
 	proto_tree_add_item(adwin_tree, hf_adwin_packet_no,      tvb, 1408,  4, ENC_LITTLE_ENDIAN);
 	proto_tree_add_item(adwin_tree, hf_adwin_data_type,      tvb, 1412,  4, ENC_LITTLE_ENDIAN);
 
 	data_type = tvb_get_letohl(tvb, 1412);
 
-	if (! global_adwin_dissect_data) {
-		call_data_dissector(tvb_new_subset_length(tvb, 8, 350*4), pinfo, adwin_debug_tree);
-		return;
-	}
-
-	for (i = 0; i < 350; i++) {
-		proto_item *item;
-		guint32 offset = 8 + i * (int)sizeof(guint32);
-		gint32 value = tvb_get_letohl(tvb, offset);
-		void * fvalue = &value;
-		switch (data_type) {
-		case 2:
-		case 3:
-		case 4:  /* some kind of int, usually int/long */
-			proto_tree_add_none_format(adwin_debug_tree, hf_adwin_data, tvb, offset, 4,
-					    "Data[%3d]: %10d - 0x%08x",
-					    i, value, value);
-			item = proto_tree_add_item(adwin_debug_tree, hf_adwin_data_int,   tvb, offset, 4, ENC_LITTLE_ENDIAN);
-			PROTO_ITEM_SET_HIDDEN(item);
-			item = proto_tree_add_item(adwin_debug_tree, hf_adwin_data_hex,   tvb, offset, 4, ENC_LITTLE_ENDIAN);
-			PROTO_ITEM_SET_HIDDEN(item);
-			break;
-		case 5: /* float */
-			proto_tree_add_none_format(adwin_debug_tree, hf_adwin_data, tvb, offset, 4,
-					    "Data[%3d]: %10f - 0x%08x",
-					    i, *(float*)fvalue, value);
-			item = proto_tree_add_item(adwin_debug_tree, hf_adwin_data_float, tvb, offset, 4, ENC_LITTLE_ENDIAN);
-			PROTO_ITEM_SET_HIDDEN(item);
-			item = proto_tree_add_item(adwin_debug_tree, hf_adwin_data_hex,   tvb, offset, 4, ENC_LITTLE_ENDIAN);
-			PROTO_ITEM_SET_HIDDEN(item);
-			break;
-		default: /* string, double, variant, something funny... */
-			proto_tree_add_none_format(adwin_debug_tree, hf_adwin_data, tvb, offset, 4,
-					    "Data[%3d]: 0x%08x",
-					    i, value);
-			item = proto_tree_add_item(adwin_debug_tree, hf_adwin_data_hex,   tvb, offset, 4, ENC_LITTLE_ENDIAN);
-			PROTO_ITEM_SET_HIDDEN(item);
-		}
-	}
+	dissect_data(tvb, pinfo, adwin_debug_tree, 8, 0, 0, 350, data_type, DISP_STR_DATA_OR_FIFO);
 }
 
 static void
 dissect_GDSHP(tvbuff_t *tvb, packet_info *pinfo,
 	      proto_tree *adwin_tree, proto_tree *adwin_debug_tree)
 {
-	guint32 i, seq_num;
+	guint32 seq_num;
 
 	/* Get the transaction identifier */
 	seq_num = tvb_get_ntohl(tvb, 0);
-	adwin_request_response_handling(tvb, pinfo, adwin_tree, seq_num, ADWIN_RESPONSE);
+	adwin_request_response_handling(tvb, pinfo, adwin_tree, seq_num, ADWIN_RESPONSE, NULL);
 
 	if (! adwin_tree)
 		return;
@@ -999,26 +1155,7 @@ dissect_GDSHP(tvbuff_t *tvb, packet_info *pinfo,
 	proto_tree_add_item(adwin_tree, hf_adwin_packet_no,      tvb, 4,  4, ENC_BIG_ENDIAN);
 	proto_tree_add_item(adwin_tree, hf_adwin_unused,         tvb, 8,  4, ENC_NA);
 
-	if (! global_adwin_dissect_data) {
-		call_data_dissector(tvb_new_subset_length(tvb, 12, 336*4), pinfo, adwin_debug_tree);
-		return;
-	}
-
-	for (i = 0; i < 336; i++) {
-		proto_item *item;
-		guint32 offset = 12 + i * (int)sizeof(guint32);
-		gint32 value = tvb_get_letohl(tvb, offset);
-		void * fvalue = &value;
-		proto_tree_add_none_format(adwin_debug_tree, hf_adwin_data, tvb, offset, 4,
-				    "Data[%3d]: %10d - %10f - 0x%08x",
-				    i, value, *(float*)fvalue, value);
-		item = proto_tree_add_item(adwin_debug_tree, hf_adwin_data_int,   tvb, offset, 4, ENC_LITTLE_ENDIAN);
-		PROTO_ITEM_SET_HIDDEN(item);
-		item = proto_tree_add_item(adwin_debug_tree, hf_adwin_data_float, tvb, offset, 4, ENC_LITTLE_ENDIAN);
-		PROTO_ITEM_SET_HIDDEN(item);
-		item = proto_tree_add_item(adwin_debug_tree, hf_adwin_data_hex,   tvb, offset, 4, ENC_LITTLE_ENDIAN);
-		PROTO_ITEM_SET_HIDDEN(item);
-	}
+	dissect_data(tvb, pinfo, adwin_debug_tree, 12, 0, 0, 336, ADWIN_FLOAT_OR_INTEGER, DISP_STR_DATA_OR_FIFO);
 }
 
 static void
@@ -1030,7 +1167,7 @@ dissect_GDSHR(tvbuff_t *tvb, packet_info *pinfo,
 
 	/* Get the transaction identifier */
 	seq_num = tvb_get_ntohl(tvb, 0);
-	adwin_request_response_handling(tvb, pinfo, adwin_tree, seq_num, ADWIN_RESPONSE);
+	adwin_request_response_handling(tvb, pinfo, adwin_tree, seq_num, ADWIN_RESPONSE, NULL);
 
 	if (! adwin_tree)
 		return;
@@ -1077,7 +1214,7 @@ dissect_GDSHR(tvbuff_t *tvb, packet_info *pinfo,
    called. */
 
 static int
-dissect_adwin(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
+dissect_adwin_udp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
 {
 	proto_item *ti, *ti2;
 	proto_tree *adwin_tree, *adwin_debug_tree;
@@ -1098,15 +1235,20 @@ dissect_adwin(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U
 	      || length == GetDataSHRequest_LENGTH))
 		return(0);
 
-	col_set_str(pinfo->cinfo, COL_PROTOCOL, "ADwin");
+	col_set_str(pinfo->cinfo, COL_PROTOCOL, "ADwin UDP");
 	col_clear(pinfo->cinfo, COL_INFO);
 
-	ti = proto_tree_add_item(tree, proto_adwin, tvb, 0, -1, ENC_NA);
-	adwin_tree = proto_item_add_subtree(ti, ett_adwin);
+	if (tree) {
+		ti = proto_tree_add_item(tree, proto_adwin, tvb, 0, -1, ENC_NA);
+		adwin_tree = proto_item_add_subtree(ti, ett_adwin);
 
-	ti2 = proto_tree_add_item(adwin_tree, proto_adwin, tvb, 0, -1, ENC_NA);
-	adwin_debug_tree = proto_item_add_subtree(ti2, ett_adwin_debug);
-	proto_item_set_text(ti2, "ADwin Debug information");
+		ti2 = proto_tree_add_item(adwin_tree, proto_adwin, tvb, 0, -1, ENC_NA);
+		adwin_debug_tree = proto_item_add_subtree(ti2, ett_adwin_debug);
+		proto_item_set_text(ti2, "ADwin Debug information");
+	} else {
+		adwin_tree = NULL;
+		adwin_debug_tree = NULL;
+	}
 
 	switch (length) {
 	case UDPH1_OLD_LENGTH:
@@ -1151,14 +1293,460 @@ dissect_adwin(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U
 	return (tvb_reported_length(tvb));
 }
 
+static guint
+get_adwin_tcp_len(packet_info *pinfo _U_, tvbuff_t *tvb, int offset, void *data _U_)
+{
+	/*
+	 * Return the length of the packet. (Doesn't include the length field itself)
+	 */
+	return tvb_get_ntohl(tvb, offset + 8) + 16;
+}
+
+
+static int
+dissect_adwin_tcp_req(tvbuff_t *tvb,  packet_info *pinfo _U_, void* data _U_,
+		      proto_tree *adwin_tree, proto_tree *adwin_debug_tree)
+{
+	guint32 seq_num, req_len;
+	const gchar *info_string;
+	adwin_transaction_t *transaction = NULL;
+	proto_item *item;
+	
+	seq_num = tvb_get_ntohl(tvb, 4);
+	req_len = tvb_get_ntohl(tvb, 8);
+	
+	adwin_request_response_handling(tvb, pinfo, adwin_tree, seq_num, ADWIN_REQUEST, &transaction);
+	
+	proto_tree_add_item(adwin_tree, hf_adwin_tcp_req_flag,   tvb,  0,  4, ENC_BIG_ENDIAN);
+	proto_tree_add_item(adwin_tree, hf_adwin_tcp_req_count,  tvb,  4,  4, ENC_BIG_ENDIAN);
+	proto_tree_add_item(adwin_tree, hf_adwin_tcp_req_len,    tvb,  8,  4, ENC_BIG_ENDIAN);
+	proto_tree_add_item(adwin_tree, hf_adwin_instruction,    tvb, 12,  4, ENC_BIG_ENDIAN);
+
+	if (! transaction) {
+		return tvb_captured_length(tvb);
+	}
+
+	transaction->command = tvb_get_ntohl(tvb, 12);
+	
+	info_string = wmem_strdup_printf(wmem_packet_scope(), "%s: %s", "Request",
+					 val_to_str_ext(transaction->command, &instruction_mapping_ext, "unknown instruction: %d"));
+
+	switch (transaction->command) {
+	case I_3PLUS1:
+		transaction->command3p1 = tvb_get_ntohl(tvb, 16);
+		transaction->additional_info1 = tvb_get_ntohl(tvb, 20);
+		info_string = wmem_strdup_printf(wmem_packet_scope(), "%s: %s", info_string, // todo: info_string overlaps!!!
+						 val_to_str_ext(transaction->command3p1, &instruction_3plus1_mapping_ext, "unknown 3+1 code: %d"));
+		
+		proto_tree_add_item(adwin_tree, hf_adwin_i3plus1,      tvb, 16,  4, ENC_BIG_ENDIAN);
+		
+		switch (transaction->command3p1) {
+		case I_3P1_GET_PAR:
+		case I_3P1_GET_DATA_STRING_SIZE:
+		case I_3P1_GET_DATA_LENGTH:
+		case I_3P1_GET_FIFO_EMPTY:
+		case I_3P1_GET_FIFO_COUNT:	
+		case I_3P1_START:
+		case I_3P1_STOP:
+		case I_3P1_CLEAR_DATA:
+		case I_3P1_CLEAR_PROCESS:
+		case I_3P1_CLEAR_FIFO:
+		case I_3P1_ADC:
+			/* only 1 useful value */
+			proto_tree_add_item(adwin_debug_tree, hf_adwin_val1,    tvb, 16,  4, ENC_BIG_ENDIAN);
+			proto_tree_add_item(adwin_debug_tree, hf_adwin_unused,  tvb, 20, 12, ENC_NA);
+			break;
+		case I_3P1_GET_MEMORY_INFO:
+		case I_3P1_GET_DETAILED_MEM_INFO:
+		case I_3P1_GET_DIGIN:
+		case I_3P1_GET_DIGOUT:
+		case I_3P1_SET_DIGOUT:
+		case I_3P1_DAC:
+			/* only 2 useful value, both integer */
+			proto_tree_add_item(adwin_tree, hf_adwin_val1,          tvb, 16,  4, ENC_BIG_ENDIAN);
+			proto_tree_add_item(adwin_tree, hf_adwin_val2,          tvb, 20,  4, ENC_BIG_ENDIAN);
+			proto_tree_add_item(adwin_debug_tree, hf_adwin_unused,  tvb, 24,  8, ENC_NA);
+			break;
+		case I_3P1_SET_PAR:
+			/* only 2 useful values, second may be integer or float */
+			proto_tree_add_item(adwin_tree, hf_adwin_val1,          tvb, 16,  4, ENC_BIG_ENDIAN);
+			proto_tree_add_item(adwin_tree, hf_adwin_val2,          tvb, 20,  4, ENC_BIG_ENDIAN);
+			proto_tree_add_item(adwin_tree, hf_adwin_val2f,         tvb, 20,  4, ENC_BIG_ENDIAN);
+			proto_tree_add_item(adwin_debug_tree, hf_adwin_unused,  tvb, 24,  8, ENC_NA);
+			break;
+		default:
+			/* printf("invalid 3p1 command found: %d\n", transaction->command3p1); */
+			;
+		}
+		break;
+	case I_BOOT:
+	case I_LOAD_BIN_FILE:
+		proto_tree_add_item(adwin_debug_tree, hf_adwin_blob,  tvb, 16,  req_len, ENC_NA);
+		/* just binary blob */
+		break;
+
+	case I_GET_DATA:
+	case I_GET_FIFO:
+		proto_tree_add_item(adwin_tree, hf_adwin_data_no32,        tvb, 16,  4, ENC_BIG_ENDIAN);
+		if (transaction->command == I_GET_DATA) {
+			proto_tree_add_item(adwin_tree, hf_adwin_start_index, tvb, 20,  4, ENC_BIG_ENDIAN);
+		} else {
+			proto_tree_add_item(adwin_tree, hf_adwin_unused,   tvb, 20,  4, ENC_NA);
+		}
+		proto_tree_add_item(adwin_tree, hf_adwin_count,            tvb, 24,  4, ENC_BIG_ENDIAN);
+		transaction->additional_info1 = tvb_get_ntohl(tvb, 16);
+		transaction->additional_info2 = tvb_get_ntohl(tvb, 20);
+		transaction->additional_info3 = tvb_get_ntohl(tvb, 24);
+		break;
+		
+	case I_CREATE_DATA:
+		proto_tree_add_item(adwin_tree, hf_adwin_data_no32,        tvb, 16,  4, ENC_BIG_ENDIAN);
+		proto_tree_add_item(adwin_tree, hf_adwin_is_fifo,          tvb, 20,  4, ENC_BIG_ENDIAN);
+		proto_tree_add_item(adwin_tree, hf_adwin_data_size,        tvb, 24,  4, ENC_BIG_ENDIAN);
+		proto_tree_add_item(adwin_tree, hf_adwin_data_type,        tvb, 28,  4, ENC_BIG_ENDIAN);
+		/* todo proto_tree_add_item(adwin_tree, hf_adwin_data_bank,        tvb, 32,  4, ENC_BIG_ENDIAN); */
+		break;
+		
+	case I_GET_PAR_ALL:
+		proto_tree_add_item(adwin_tree, hf_adwin_start_index,      tvb, 16,  4, ENC_BIG_ENDIAN);
+		proto_tree_add_item(adwin_tree, hf_adwin_count,            tvb, 20,  4, ENC_BIG_ENDIAN);
+		transaction->additional_info1 = tvb_get_ntohl(tvb, 16); 
+		transaction->additional_info2 = tvb_get_ntohl(tvb, 20); 
+		break;
+		
+	case I_GET_DATA_INFO:
+	case I_GET_DATA_TYPE:
+		proto_tree_add_item(adwin_tree, hf_adwin_data_no32,        tvb, 16,  4, ENC_BIG_ENDIAN);
+		break;
+		
+	case I_SET_DATA:
+	case I_SET_FIFO: {
+		guint32 start_index, display_string_type, count, data_type, data_no;
+		count = tvb_get_ntohl(tvb, 24);
+		data_type = tvb_get_ntohl(tvb, 28);
+		data_no = tvb_get_ntohl(tvb, 16);
+		
+		proto_tree_add_item(adwin_tree, hf_adwin_data_no32,        tvb, 16,  4, ENC_BIG_ENDIAN);
+		if (transaction->command == I_SET_DATA) {
+			proto_tree_add_item(adwin_tree, hf_adwin_start_index, tvb, 20,  4, ENC_BIG_ENDIAN);
+			start_index = tvb_get_ntohl(tvb, 20);
+			display_string_type = DISP_STR_DATA;
+		} else {
+			proto_tree_add_item(adwin_tree, hf_adwin_unused,   tvb, 20,  4, ENC_NA);
+			start_index = 0;
+			display_string_type = DISP_STR_FIFO;
+		}
+		proto_tree_add_item(adwin_tree, hf_adwin_count,            tvb, 24,  4, ENC_BIG_ENDIAN);
+		proto_tree_add_item(adwin_tree, hf_adwin_data_type,        tvb, 28,  4, ENC_BIG_ENDIAN);
+
+		dissect_data(tvb, pinfo, adwin_debug_tree, 32, data_no,
+			     start_index, count, data_type, display_string_type);
+
+		break;
+	}
+	case I_GET_WORKLOAD:
+	case I_TEST_VERSION:
+		/* no additional parameters */
+		break;
+
+	case I_AUTHENTICATE: {
+		gchar* dll_version_s;
+		gint32 dll_i;
+		dll_i = tvb_get_ntohl(tvb, 16);
+		dll_version_s = wmem_strdup_printf(wmem_packet_scope(), "%d.%d.%d",
+						   dll_i / 1000000,
+						   (dll_i - dll_i / 1000000 * 1000000) / 1000,
+						   dll_i % 1000);
+		proto_tree_add_string(adwin_debug_tree, hf_adwin_dll_version, tvb, 16, 4, dll_version_s);
+		
+		proto_tree_add_item(adwin_tree, hf_adwin_password,      tvb, 20, 12, ENC_ASCII|ENC_NA);
+		proto_tree_add_item(adwin_tree, hf_adwin_timeout,       tvb, 32,  4, ENC_BIG_ENDIAN);
+		proto_tree_add_item(adwin_tree, hf_adwin_timeout_size,  tvb, 36,  4, ENC_BIG_ENDIAN);
+		break;
+	}
+
+	case I_GET_MEMORY:
+		proto_tree_add_item(adwin_tree, hf_adwin_address,       tvb, 16,  4, ENC_BIG_ENDIAN);
+		proto_tree_add_item(adwin_tree, hf_adwin_count,         tvb, 20,  4, ENC_BIG_ENDIAN);
+		transaction->additional_info1 = tvb_get_ntohl(tvb, 16);
+		transaction->additional_info2 = tvb_get_ntohl(tvb, 20);
+		break;
+
+	case I_GET_ARM_VERSION:
+	case I_GET_DATA_SHIFTED_HANDSHAKE:
+	case I_SET_DATA_LAST_STATUS:
+	case I_GET_FIFO_RETRY:
+	case I_SET_FIFO_RETRY:
+	case I_GET_DATA_SMALL:
+	case I_SET_DATA_N:
+	case I_SET_FIFO_N:
+	case I_GET_DATA_N:
+	case I_GET_FIFO_N:
+		item = proto_tree_add_string(adwin_debug_tree, hf_adwin_tcp_error,
+					   tvb, 0, 0, "This instruction should not be used with TCP - Protocol error!");
+		PROTO_ITEM_SET_GENERATED(item);
+		break;
+	}
+	col_add_str(pinfo->cinfo, COL_INFO, info_string);
+	
+	return tvb_captured_length(tvb);
+}
+
+static int
+dissect_adwin_tcp_resp(tvbuff_t *tvb,  packet_info *pinfo _U_, void* data _U_,
+		      proto_tree *adwin_tree, proto_tree *adwin_debug_tree)
+{
+	guint32 seq_num, resp_len, status;
+	const gchar *info_string;
+	adwin_transaction_t *transaction = NULL;
+	proto_item *item;
+	
+	col_set_str(pinfo->cinfo, COL_PROTOCOL, "ADwin TCP");
+	col_clear(pinfo->cinfo, COL_INFO);
+
+	seq_num = tvb_get_ntohl(tvb, 4);
+	resp_len = tvb_get_ntohl(tvb, 8);
+	status = tvb_get_ntohl(tvb, 12);
+	
+	adwin_request_response_handling(tvb, pinfo, adwin_tree, seq_num, ADWIN_RESPONSE, &transaction);
+
+	       
+	proto_tree_add_item(adwin_tree, hf_adwin_tcp_resp_flag,  tvb,  0,  4, ENC_BIG_ENDIAN);
+	proto_tree_add_item(adwin_tree, hf_adwin_tcp_req_count,  tvb,  4,  4, ENC_BIG_ENDIAN);
+	proto_tree_add_item(adwin_tree, hf_adwin_tcp_req_len,    tvb,  8,  4, ENC_BIG_ENDIAN);
+	proto_tree_add_item(adwin_tree, hf_adwin_status_header,  tvb, 12,  4, ENC_BIG_ENDIAN);
+	
+	info_string = try_val_to_str_ext(status, &error_code_mapping_ext);
+	if (info_string) {
+		info_string = wmem_strdup_printf(wmem_packet_scope(), "Response: %s", info_string);
+	} else {
+		info_string = wmem_strdup_printf(wmem_packet_scope(), "Undefined error code %d", status);
+	}
+	
+	col_add_str(pinfo->cinfo, COL_INFO, info_string);
+
+	if (! transaction) {
+		return tvb_captured_length(tvb);
+	}
+
+	item = proto_tree_add_int(adwin_tree, hf_adwin_response_to_instruction,
+					    tvb, 0, 0, transaction->command);
+	PROTO_ITEM_SET_GENERATED(item);
+
+	
+	switch (transaction->command) {
+	case I_3PLUS1:
+		item = proto_tree_add_int(adwin_tree, hf_adwin_response_to_i3plus1,
+					tvb, 0, 0, transaction->command3p1);
+		PROTO_ITEM_SET_GENERATED(item);
+		switch (transaction->command3p1) {
+		case I_3P1_GET_PAR:
+			/* only 1 useful value, maybe float or int */
+			proto_tree_add_item(adwin_tree, hf_adwin_val1,          tvb, 16,  4, ENC_BIG_ENDIAN);
+			proto_tree_add_item(adwin_tree, hf_adwin_val1f,         tvb, 16,  4, ENC_BIG_ENDIAN);
+			proto_tree_add_item(adwin_debug_tree, hf_adwin_unused,  tvb, 20, 12, ENC_NA);
+			break;
+		case I_3P1_GET_DATA_STRING_SIZE:
+		case I_3P1_GET_MEMORY_INFO:
+		case I_3P1_GET_DETAILED_MEM_INFO:
+		case I_3P1_GET_DATA_LENGTH:
+		case I_3P1_GET_FIFO_EMPTY:
+		case I_3P1_GET_FIFO_COUNT:	
+		case I_3P1_ADC:
+		case I_3P1_GET_DIGIN:
+		case I_3P1_GET_DIGOUT:
+			/* only 1 useful value, always integer */
+			proto_tree_add_item(adwin_tree, hf_adwin_val1,          tvb, 16,  4, ENC_BIG_ENDIAN);
+			proto_tree_add_item(adwin_debug_tree, hf_adwin_unused,  tvb, 20, 12, ENC_NA);
+			break;
+		case I_3P1_START:
+		case I_3P1_STOP:
+		case I_3P1_SET_PAR:
+		case I_3P1_CLEAR_DATA:
+		case I_3P1_CLEAR_PROCESS:
+		case I_3P1_CLEAR_FIFO:
+		case I_3P1_DAC:
+		case I_3P1_SET_DIGOUT:
+			/* no useful values (besides status in header) */
+			proto_tree_add_item(adwin_debug_tree, hf_adwin_unused,  tvb, 16, 16, ENC_NA);
+			break;
+		default:
+			/* printf("invalid 3p1 command found: %d\n", transaction->command3p1); */
+			;
+		}
+		break;
+
+	case I_BOOT:
+	case I_LOAD_BIN_FILE:
+	case I_SET_DATA:
+	case I_SET_FIFO:
+	case I_CREATE_DATA:
+		/* no info except of status in header */
+		break;
+
+	case I_GET_PAR_ALL: {
+		guint32 display_string_type = DISP_STR_PAR, data_type = ADWIN_INTEGER, start_index = 0, count;
+		count = transaction->additional_info2;
+		if ((transaction->additional_info1 >   0) && (transaction->additional_info1 < 100)) {
+			data_type = ADWIN_INTEGER;
+			display_string_type = DISP_STR_PAR;
+			start_index = transaction->additional_info1;
+		}
+		else if ((transaction->additional_info1 > 100) && (transaction->additional_info1 < 200)) {
+			data_type = ADWIN_FLOAT;
+			start_index = transaction->additional_info1 - 100;
+			display_string_type = DISP_STR_FPAR;
+		}
+		else if ((transaction->additional_info1 > 200) && (transaction->additional_info1 < 300)) {
+			data_type = ADWIN_DOUBLE;
+			display_string_type = DISP_STR_FPAR_DOUBLE;
+			start_index = transaction->additional_info1 - 200;
+			/* for this type, the count must be devided by two (i.e., count is 4 for 2 doubles) */
+			count /= 2;
+		}
+		dissect_data(tvb, pinfo, adwin_debug_tree, 16, 0, start_index, count, data_type, display_string_type);
+		break;
+	}
+	case I_GET_WORKLOAD:
+		proto_tree_add_item(adwin_tree, hf_adwin_val1,          tvb, 16,  4, ENC_BIG_ENDIAN);
+		proto_tree_add_item(adwin_tree, hf_adwin_val2,          tvb, 20,  4, ENC_BIG_ENDIAN);
+		proto_tree_add_item(adwin_tree, hf_adwin_val3,          tvb, 24,  4, ENC_BIG_ENDIAN);
+		proto_tree_add_item(adwin_tree, hf_adwin_unused,        tvb, 28,  4, ENC_NA);
+		break;
+		
+	case I_GET_DATA_INFO:
+		proto_tree_add_item(adwin_tree, hf_adwin_data_type,     tvb, 16,  4, ENC_BIG_ENDIAN);
+		proto_tree_add_item(adwin_tree, hf_adwin_data_size,     tvb, 20,  4, ENC_BIG_ENDIAN);
+		proto_tree_add_item(adwin_tree, hf_adwin_is_fifo,       tvb, 24,  4, ENC_BIG_ENDIAN);
+		proto_tree_add_item(adwin_tree, hf_adwin_fifo_full,     tvb, 28,  4, ENC_BIG_ENDIAN);
+		break;
+		
+	case I_GET_DATA_TYPE:
+		proto_tree_add_item(adwin_tree, hf_adwin_data_type,     tvb, 16,  4, ENC_BIG_ENDIAN);
+		break;
+
+	case I_GET_FIFO:
+	case I_GET_DATA: {
+		guint32 display_str_type, data_type;
+		data_type = tvb_get_ntohl(tvb, 16);
+		proto_tree_add_item(adwin_tree, hf_adwin_data_type,      tvb, 16,  4, ENC_BIG_ENDIAN);
+		
+		proto_tree_add_item(adwin_tree, hf_adwin_data_size,      tvb, 20,  4, ENC_BIG_ENDIAN);
+		if (transaction->command == I_GET_DATA) {
+			proto_tree_add_item(adwin_tree, hf_adwin_unused,         tvb, 24,  4, ENC_NA);
+			display_str_type = DISP_STR_DATA;
+		} else {
+			proto_tree_add_item(adwin_tree, hf_adwin_fifo_full,    tvb, 24,  4, ENC_BIG_ENDIAN);
+			display_str_type = DISP_STR_FIFO;
+		}
+
+		dissect_data(tvb, pinfo, adwin_debug_tree, 28, transaction->additional_info1,
+			     transaction->additional_info2, transaction->additional_info3, data_type,
+			     display_str_type);
+		break;
+	}		
+	case I_SET_DATA_N:
+	case I_SET_FIFO_N:
+	case I_GET_DATA_N:
+	case I_GET_FIFO_N:
+	case I_GET_DATA_SHIFTED_HANDSHAKE:
+	case I_SET_DATA_LAST_STATUS:
+	case I_GET_FIFO_RETRY:
+	case I_SET_FIFO_RETRY:
+	case I_GET_DATA_SMALL:
+	case I_GET_ARM_VERSION:
+		item = proto_tree_add_string(adwin_debug_tree, hf_adwin_tcp_error,
+					   tvb, 0, 0, "This instruction should not be used with TCP - Protocol error!");
+		PROTO_ITEM_SET_GENERATED(item);
+		break;
+		
+	case I_TEST_VERSION:
+		/* no really useful info... */
+		proto_tree_add_item(adwin_debug_tree, hf_adwin_unused,  tvb, 16,  16, ENC_NA);
+		break;
+		
+	case I_AUTHENTICATE:
+		proto_tree_add_item(adwin_tree, hf_adwin_processor,     tvb, 16,  4, ENC_BIG_ENDIAN);
+		proto_tree_add_item(adwin_tree, hf_adwin_conn_count,    tvb, 20,  4, ENC_BIG_ENDIAN);
+		proto_tree_add_item(adwin_tree, hf_adwin_firmware_vers, tvb, 24,  4, ENC_BIG_ENDIAN);
+		proto_tree_add_item(adwin_tree, hf_adwin_firmware_vers_beta, tvb, 28,  4, ENC_BIG_ENDIAN);
+		break;
+		
+	case I_GET_MEMORY: {
+		dissect_data(tvb, pinfo, adwin_debug_tree, 16, 0,
+			     transaction->additional_info1, transaction->additional_info2, ADWIN_INTEGER, DISP_STR_MEMORY);
+		proto_tree_add_item(adwin_tree, hf_adwin_status_final,   tvb, 16 + resp_len - 4,  4, ENC_BIG_ENDIAN);
+		break;
+	}}
+		
+	return tvb_captured_length(tvb);
+}
+
+static int
+dissect_adwin_tcp_req_resp(tvbuff_t *tvb,  packet_info *pinfo _U_, proto_tree *tree, void* data _U_)
+{
+	proto_item *ti, *ti2;
+	proto_tree *adwin_tree, *adwin_debug_tree;
+
+	col_set_str(pinfo->cinfo, COL_PROTOCOL, "ADwin TCP");
+	col_clear(pinfo->cinfo, COL_INFO);
+
+	if (tree) {
+		ti = proto_tree_add_item(tree, proto_adwin, tvb, 0, -1, ENC_NA);
+		adwin_tree = proto_item_add_subtree(ti, ett_adwin);
+		
+		ti2 = proto_tree_add_item(adwin_tree, proto_adwin, tvb, 0, -1, ENC_NA);
+		adwin_debug_tree = proto_item_add_subtree(ti2, ett_adwin_debug);
+		proto_item_set_text(ti2, "ADwin Debug information");
+	} else {
+		adwin_tree = NULL;
+		adwin_debug_tree = NULL;
+	}
+
+	switch (tvb_get_ntohl(tvb, 0)) {
+	case ADWIN_TCP_MAGIC_FLAG_REQUEST:
+		dissect_adwin_tcp_req(tvb, pinfo, data, adwin_tree, adwin_debug_tree);
+		break;
+	case ADWIN_TCP_MAGIC_FLAG_RESPONSE:
+		dissect_adwin_tcp_resp(tvb, pinfo, data, adwin_tree, adwin_debug_tree);
+		break;
+	default:
+		/* printf("invalid flag\n"); */
+		return 0;
+	}
+
+	return tvb_captured_length(tvb);
+}
+
+static int
+dissect_adwin_tcp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
+{
+	if(!(pinfo->srcport == global_adwin_port || pinfo->destport == global_adwin_port))
+		return 0;
+	
+	tcp_dissect_pdus(tvb, pinfo, tree, 1, 16, get_adwin_tcp_len, dissect_adwin_tcp_req_resp, NULL);
+	
+	return (tvb_reported_length(tvb));
+}
 
 void
 proto_reg_handoff_adwin(void)
 {
-	dissector_handle_t adwin_handle;
+	static int adwin_prefs_initialized = FALSE;
+	static dissector_handle_t adwin_handle_udp, adwin_handle_tcp;
 
-	adwin_handle = create_dissector_handle(dissect_adwin, proto_adwin);
-	dissector_add_uint_with_preference("udp.port", ADWIN_COMM_PORT, adwin_handle);
+	if (! adwin_prefs_initialized) {
+		adwin_handle_udp = create_dissector_handle(dissect_adwin_udp, proto_adwin);
+		adwin_handle_tcp = create_dissector_handle(dissect_adwin_tcp, proto_adwin);
+		data_handle = find_dissector("data");
+		adwin_prefs_initialized = TRUE;
+	} else {
+		dissector_delete_uint("udp.port", global_adwin_port, adwin_handle_udp);
+		dissector_delete_uint("tcp.port", global_adwin_port, adwin_handle_tcp);
+	}
+
+	dissector_add_uint("udp.port", global_adwin_port, adwin_handle_udp);
+	dissector_add_uint("tcp.port", global_adwin_port, adwin_handle_tcp);
 }
 
 void
@@ -1180,6 +1768,11 @@ proto_register_adwin(void)
 		    FT_UINT32, BASE_DEC, NULL, 0x0,
 		    "Size of binary file", HFILL }
 		},
+		{ &hf_adwin_blob,
+		  { "Binary information", "adwin.blob",
+		    FT_NONE, BASE_NONE, NULL, 0x0,
+		    NULL, HFILL }
+		},
 		{ &hf_adwin_blocksize,
 		  { "Blocksize", "adwin.blocksize",
 		    FT_UINT32, BASE_DEC, NULL, 0x0,
@@ -1189,6 +1782,11 @@ proto_register_adwin(void)
 		  { "Complete packets", "adwin.complete_packets",
 		    FT_UINT32, BASE_DEC, NULL, 0x0,
 		    "Highest sequential package number", HFILL }
+		},
+		{ &hf_adwin_conn_count,
+		  { "TCP connection count", "adwin.connection_count",
+		    FT_UINT32, BASE_DEC, NULL, 0x0,
+		    "Number of active TCP connections, including the current connection.", HFILL }
 		},
 		{ &hf_adwin_count,
 		  { "Count", "adwin.count",
@@ -1200,9 +1798,49 @@ proto_register_adwin(void)
 		    FT_NONE, BASE_NONE, NULL, 0x0,
 		    NULL, HFILL }
 		},
-		{ &hf_adwin_data_int,
-		  { "Data element int", "adwin.data_int",
-		    FT_INT32, BASE_DEC, NULL, 0x0,
+		{ &hf_adwin_data_int8,
+		  { "Data element int8", "adwin.data_int8",
+		    FT_INT8, BASE_DEC, NULL, 0x0,
+		    NULL, HFILL }
+		},
+		{ &hf_adwin_data_int8_hex,
+		  { "Data element int8 (hex notation)", "adwin.data_int8_hex",
+		    FT_UINT8, BASE_HEX, NULL, 0x0,
+		    NULL, HFILL }
+		},
+		{ &hf_adwin_data_int16,
+		  { "Data element int16", "adwin.data_int16",
+		    FT_INT16, BASE_DEC, NULL, 0x0,
+		    NULL, HFILL }
+		},
+		{ &hf_adwin_data_int16_hex,
+		  { "Data element int16 (hex notation)", "adwin.data_int16_hex",
+		    FT_UINT16, BASE_HEX, NULL, 0x0,
+		    NULL, HFILL }
+		},
+		{ &hf_adwin_data_int32,
+		  { "Data element int32", "adwin.data_int32",
+ 		    FT_INT32, BASE_DEC, NULL, 0x0,
+ 		    NULL, HFILL }
+ 		},
+		{ &hf_adwin_data_int32_hex,
+		  { "Data element int32 (hex notation)", "adwin.data_int32_hex",
+		    FT_UINT32, BASE_HEX, NULL, 0x0,
+		    NULL, HFILL }
+		},
+		{ &hf_adwin_data_int64,
+		  { "Data element int64", "adwin.data_int64",
+		    FT_INT64, BASE_DEC, NULL, 0x0,
+		    NULL, HFILL }
+		},
+		{ &hf_adwin_data_int64_hex,
+		  { "Data element int64 (hex notation)", "adwin.data_int64_hex",
+		    FT_UINT64, BASE_HEX, NULL, 0x0,
+		    NULL, HFILL }
+		},
+		{ &hf_adwin_data_double,
+		  { "Data element double", "adwin.data_double",
+		    FT_DOUBLE, BASE_NONE, NULL, 0x0,
 		    NULL, HFILL }
 		},
 		{ &hf_adwin_data_float,
@@ -1210,11 +1848,11 @@ proto_register_adwin(void)
 		    FT_FLOAT, BASE_NONE, NULL, 0x0,
 		    NULL, HFILL }
 		},
-		{ &hf_adwin_data_hex,
-		  { "Data element hex", "adwin.data_hex",
-		    FT_UINT32, BASE_HEX, NULL, 0x0,
-		    NULL, HFILL }
-		},
+		{ &hf_adwin_data_string,
+		  { "Data element string", "adwin.data_string",
+		    FT_STRING, BASE_NONE, NULL, 0x0,
+ 		    NULL, HFILL }
+ 		},
 		{ &hf_adwin_data_no16,
 		  { "Data No. (16bit)", "adwin.data_no16",
 		    FT_UINT16, BASE_DEC, NULL, 0x0,
@@ -1222,6 +1860,11 @@ proto_register_adwin(void)
 		},
 		{ &hf_adwin_data_no32,
 		  { "Data No. (32bit)", "adwin.data_no32",
+		    FT_UINT32, BASE_DEC, NULL, 0x0,
+		    NULL, HFILL }
+		},
+		{ &hf_adwin_data_size,
+		  { "Data size", "adwin.data_size",
 		    FT_UINT32, BASE_DEC, NULL, 0x0,
 		    NULL, HFILL }
 		},
@@ -1240,6 +1883,11 @@ proto_register_adwin(void)
 		    FT_STRINGZ, BASE_NONE, NULL, 0x0,
 		    NULL, HFILL }
 		},
+		{ &hf_adwin_fifo_full,
+		  { "Fifo full count", "adwin.fifo_full",
+		    FT_UINT32, BASE_DEC, NULL, 0x0,
+		    NULL, HFILL }
+		},
 		{ &hf_adwin_fifo_no16,
 		  { "FiFo No. (16bit)", "adwin.fifo_no",
 		    FT_UINT32, BASE_DEC, NULL, 0x0,
@@ -1250,6 +1898,16 @@ proto_register_adwin(void)
 		    FT_UINT32, BASE_DEC, NULL, 0x0,
 		    NULL, HFILL }
 		},
+		{ &hf_adwin_firmware_vers,
+		  { "Firmware version", "adwin.firmware_version",
+		    FT_UINT32, BASE_DEC, NULL, 0x0,
+		    NULL, HFILL }
+		},
+		{ &hf_adwin_firmware_vers_beta,
+		  { "Firmware version (beta)", "adwin.firmware_version_beta",
+		    FT_UINT32, BASE_DEC, NULL, 0x0,
+		    NULL, HFILL }
+		},
 		{ &hf_adwin_instruction,
 		  { "Instruction", "adwin.instruction",
 		    FT_UINT32, BASE_DEC|BASE_EXT_STRING, &instruction_mapping_ext, 0x0,
@@ -1257,6 +1915,11 @@ proto_register_adwin(void)
 		},
 		{ &hf_adwin_is_range,
 		  { "packets are a range", "adwin.is_range",
+		    FT_UINT32, BASE_DEC, NULL, 0x0,
+		    NULL, HFILL }
+		},
+		{ &hf_adwin_is_fifo,
+		  { "Is fifo", "adwin.is_fifo",
 		    FT_UINT32, BASE_DEC, NULL, 0x0,
 		    NULL, HFILL }
 		},
@@ -1350,6 +2013,16 @@ proto_register_adwin(void)
 		    FT_RELATIVE_TIME, BASE_NONE, NULL, 0x0,
 		    "The time between the Request and the Reply", HFILL }
 		},
+		{ &hf_adwin_response_to_i3plus1,
+		  { "Response to 3+1 Instruction", "adwin.response_to_i3plus1",
+		    FT_INT32, BASE_DEC|BASE_EXT_STRING, &instruction_3plus1_mapping_ext, 0x0,
+		    NULL, HFILL }
+		},
+		{ &hf_adwin_response_to_instruction,
+		  { "Response to instruction", "adwin.response_to_instruction",
+		    FT_INT32, BASE_DEC|BASE_EXT_STRING, &instruction_mapping_ext, 0x0,
+		    NULL, HFILL }
+		},
 		{ &hf_adwin_retry_packet_index,
 		  { "Retry packet index", "adwin.retry_packet_index",
 		    FT_UINT32, BASE_DEC, NULL, 0x0,
@@ -1365,15 +2038,25 @@ proto_register_adwin(void)
 		    FT_UINT32, BASE_DEC, NULL, 0x0,
 		    NULL, HFILL }
 		},
-		{ &hf_adwin_status,
-		  { "Status", "adwin.status",
+		{ &hf_adwin_status_header,
+		  { "Status in header", "adwin.status_header",
 		    FT_INT32, BASE_DEC|BASE_EXT_STRING, &error_code_mapping_ext, 0x0,
-		    NULL, HFILL }
+		    "Status information explicitly for this packet.", HFILL }
+		},
+		{ &hf_adwin_status_final,
+		  { "Status after data transmission", "adwin.status_final",
+		    FT_INT32, BASE_DEC|BASE_EXT_STRING, &error_code_mapping_ext, 0x0,
+		    "Status information for a preceding data transfer.", HFILL } /*  */
 		},
 		{ &hf_adwin_timeout,
 		  { "Timeout", "adwin.timeout",
 		    FT_UINT32, BASE_DEC, NULL, 0x0,
 		    "Timeout in ms", HFILL }
+		},
+		{ &hf_adwin_timeout_size,
+		  { "Data size which is relevant for timeout", "adwin.timeout_size",
+		    FT_UINT32, BASE_DEC, NULL, 0x0,
+		    "Size of data transfer in bytesthat the timeout applies to.", HFILL }
 		},
 		{ &hf_adwin_unused,
 		  { "Unused", "adwin.unused",
@@ -1393,7 +2076,12 @@ proto_register_adwin(void)
 		{ &hf_adwin_val2,
 		  { "Value 2", "adwin.val2",
 		    FT_INT32, BASE_DEC, NULL, 0x0,
-		    "Generic return value 2 (interpretation depends on request).", HFILL }
+		    "Generic return value 2 intrepreted as integer (correct interpretation depends on request).", HFILL }
+		},
+		{ &hf_adwin_val2f,
+		  { "Value 2 (as float)", "adwin.val2f",
+		    FT_FLOAT, BASE_NONE, NULL, 0x0,
+		    "Generic return value 2 interpreted as float (correct(interpretation depends on request).", HFILL }
 		},
 		{ &hf_adwin_val3,
 		  { "Value 3", "adwin.val3",
@@ -1405,6 +2093,26 @@ proto_register_adwin(void)
 		    FT_INT32, BASE_DEC, NULL, 0x0,
 		    "Generic return value 4 (interpretation depends on request).", HFILL }
 		},
+		{ &hf_adwin_tcp_req_flag,
+		  { "TCP request magic flag", "adwin.tcp_req_magic_flag",
+		    FT_UINT32, BASE_HEX, NULL, 0x0,
+		    "ADwin TCP request magic flag.", HFILL }
+		},
+		{ &hf_adwin_tcp_resp_flag,
+		  { "TCP response magic flag", "adwin.tcp_resp_magic_flag",
+		    FT_UINT32, BASE_HEX, NULL, 0x0,
+		    "ADwin TCP response magic flag.", HFILL }
+		},
+		{ &hf_adwin_tcp_req_len,
+		  { "TCP request length", "adwin.tcp_req_len",
+		    FT_UINT32, BASE_DEC, NULL, 0x0,
+		    "ADwin TCP request length.", HFILL }
+		},
+		{ &hf_adwin_tcp_req_count,
+		  { "TCP request count", "adwin.tcp_req_count",
+		    FT_UINT32, BASE_DEC, NULL, 0x0,
+		    "ADwin TCP request count.", HFILL }
+		}
 	};
 
 	/* Setup protocol subtree array */
@@ -1423,8 +2131,14 @@ proto_register_adwin(void)
 	proto_register_field_array(proto_adwin, hf, array_length(hf));
 	proto_register_subtree_array(ett, array_length(ett));
 
-	/* Register our configuration options for ADwin */
-	adwin_module = prefs_register_protocol(proto_adwin, NULL);
+	/* Register our configuration options for ADwin, particularly
+	   our port */
+	adwin_module = prefs_register_protocol(proto_adwin, proto_reg_handoff_adwin);
+
+	prefs_register_uint_preference(adwin_module, "udp.port", "ADwin TCP/UDP Port",
+				       "Set the TCP/UDP port for ADwin packets (if other"
+				       " than the default of 6543)",
+				       10, &global_adwin_port);
 
 	prefs_register_bool_preference(adwin_module, "dissect_data",
 				       "Dissect Data sections",
